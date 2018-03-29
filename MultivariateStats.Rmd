@@ -1,0 +1,256 @@
+---
+title: "Multivariate Statistics: A Primer for Biologists"
+subtitle: "Stats and Snacks"
+author: "Nathan Wisnoski"
+date: "3/19/2018"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ade4)
+library(dplyr)
+library(tibble)
+library(vegan)
+library(tidyverse)
+library(ggrepel)
+library(cowplot)
+library(Hotelling)
+library(gplots)
+library(viridis)
+library(lubridate)
+```
+Biologists often measure multiple response variables on each observational unit.
+Most basic statistical tests (e.g., linear regression, ANOVA) are only concerned with a single response variable.
+For multiple response variables, one approach is to conduct multiple univariate analyses, then correct for multiple tests (e.g., Bonferroni correction).
+However, the measured response variables are often related to one another (e.g., because they come from the same individual or because they interact in some way, like species in a community). 
+Therefore the responses are non-independent.
+Also, it is often preferable to conduct a single test that takes into account all the data at once.
+Here, we'll work through a few common ways to analyze a multivariate dataset.
+# Our Dataset: Aravo Alpine Plants
+The dataset is the distribution of 82 species of alpine plants from 75 sites.
+In addition to the species abundances, there are also species traits and environmental variables. 
+These data come from Choler (2005) _Consistent shifts in Alpine plant traits along a mesotopographical gradient_.
+```{r}
+data(aravo)
+?aravo
+comm <- aravo$spe
+env <- aravo$env
+traits <- aravo$traits
+taxa <- aravo$spe.names
+# Explore dataset
+dim(comm) # 75 sites, 82 taxa
+dim(env) # 6 environmental variables per site
+dim(traits) # 8 traits measured on each species
+summary(env)
+summary(traits)
+```
+# A Univariate Approach
+First, we'll take a look at some univariate response variables.
+For example, we may want to know which species in our dataset have similar traits. One simple way to do this might be to just look at the distribution of traits across species. Let's look at specific leaf area.
+```{r, fig.align='center', fig.height=7}
+# Which species share similar SLA?
+SLA.traits <- traits %>%
+  rownames_to_column("Species") %>% 
+  arrange(SLA) # Arrange() sorts the data by SLA
+# Create an ordered factor of species names
+SLA.traits$Species <- factor(x = SLA.traits$Species, levels = SLA.traits$Species, ordered = T)
+SLA.traits %>% 
+  ggplot(aes(x = Species, y = SLA)) + 
+  geom_point() + 
+  coord_flip() + 
+  theme_minimal()
+```
+This works, but this is just one trait.
+You could repeat this for other traits, but it would be nice to compare multiple traits at once.
+We'll do this below.
+Another question you might want to know is something about how species diversity varies across sites. 
+Let's look at a simple way to compare sites. 
+```{r, fig.align='center', fig.width=5}
+# How does richness vary by snow melt day?
+# Note, here I also fit a linear model
+richness <- data.frame(richness = rowSums(decostand(comm, method = "pa")), 
+                       snow = env$Snow)
+richness %>% 
+  rownames_to_column(var = "site") %>% 
+  ggplot(aes(x = snow, y = richness)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", formula = y ~ x) + 
+  theme_cowplot() +
+  xlab("day of snowmelt")
+# But this ignores species identity -- we have more information than we're using!
+# We might want to know how species are distributed relative to environmental variables # Let's look at one species, Agro. rupe. And let's convert the number vector to a date
+data.frame(agro_rupe = comm$Agro.rupe, snow = env$Snow) %>% 
+  mutate(snow = lubridate::as_date(env$Snow, origin = "2000-01-01")) %>% 
+  ggplot(aes(x = snow, y = agro_rupe)) + 
+  geom_jitter(height = 0.1, alpha = 0.3, size = 2) + 
+  geom_smooth(se = F) + 
+  theme_minimal() +
+  xlab("day of snowmelt")
+# note the jittering induces negative values, but they're zeros
+# Okay, we see this species is less abundant in sites that melt later in the year
+```
+You could do similar analyses for each species, environment, and trait pair, and then apply a correction for mulitple tests (e.g., Bonferroni), but this is conservative and ignores the non-independence in the data. 
+Sometimes, multivariate approaches allow you to better infer ecologically meaningful patterns in the data. 
+# A Multivariate Approach
+Now, we'll take into account the multivariate structure of the data in attempt to learn more about the species distributions in this system.
+### Some Familiar Ways to Analyze Multivariate Responses
+First, let's demonstrate some ways to use categorical predictors to test multivariate responses.
+Here, we'll create an arbitrary split between tall (> 5 units) and short (<= 5 units) and use:  
+- _Hotelling's $T^2$_ (a multivariate extension of the t-test) to see if the remaining traits have significantly different means, and     
+- _Multivariate Analysis of Variance_ (MANOVA) to look at within for among group trait variance for short versus tall plants.  
+Hotelling's $T^2$ statistic use two mean vectors and two covariance matrices to see if there's an overall difference in multiple means between groups:
+$$T^2 = \frac{n_1 \times n_2}{n_1 + n_2} (\bar{x_1} - \bar{x_2})'{\bf C}^{-1}(\bar{x_1} - \bar{x_2}) $$
+A large $T^2$ value is evidence that the group mean vectors are different. The two samples are assumed to be multivariate normal wth equal covariance matrices.
+Compare with F distribution (with $p$ and $(n1 + n2 - p -1)$ df, where $p$ is number of variables) by getting an F-statistic:
+$$F = \frac{(n_1 + n_2 - p - 1)}{(n_1 + n_2 - 2)p} T^2$$
+```{r}
+# Let's create a new dataset and arbitrarily split into tall versus short species
+traits.by.height <- traits
+traits.by.height$Height <- ifelse(traits.by.height$Height < 5, "short", "tall")
+traits.hotelling <- hotelling.test(. ~ Height, perm = F, data = traits.by.height)
+tstats <- traits.hotelling$stats
+with(tstats, {
+  f <- (nx + ny - p - 1) * statistic / ((nx + ny - 2) * p)
+  df1 <- df[1]
+  df2 <- df[2]
+  print(paste("F =", f))
+  print(paste("df1 =", df1))
+  print(paste("df2 =", df2))
+  print(paste("p = ", pf(f, df1, df2, lower.tail = F)))
+})
+traits.hotelling$pval  # same as the output from the function!
+# Suggests the trait means are not equal for tall versus short plants
+# Another way to get at this question would be from MANOVA
+trait.manova <- lm(cbind(Spread, Angle, Area, Thick, SLA,N_mass,Seed) ~ as.factor(Height), data = traits.by.height)
+summary(manova(trait.manova), test = 'Pillai')
+# Note the p-value is the same
+```
+Large values of Pillai's trace statistic suggest the samples come from populations with different mean vectors. See p. 66-70 of Manly (2017) for more info on Pillai's trace and other statistics (e.g., Wilks' lambda). Manly suggests Pillai's trace may be the most robust of these. 
+We may also want to create a model with quantitative predictors. Here, we can use _multivariate multiple regression_ to test whether some environmental characterists can predict disturbance at the site.  
+```{r}
+# It could be worthwhile to figure out if some aspects of 
+env.manova <- lm(cbind(ZoogD, PhysD) ~ Aspect + Slope + Form + Snow, data = env)
+summary(manova(env.manova), test = 'Pillai')
+```
+So from this we see that landform index appears to be a goood predictor of site disturbance.
+# Dimension Reduction
+A major goal of multivariate statistics is to reduce the dimensionality of the dataset.
+Dimension reduction (ordination) allows observations to be arranged along axes of variation such that more similar objects in the full dimensional space also appear more similar in reduced dimensions.
+Objects relative positions along ordination axes allow us to infer which objects are similar to one another and which are dissimilar. 
+### Principal Components Analysis (PCA)
+Getting back to our earlier question of which species tend to have more similar traits, we can now try to use multiple traits to answer this question. 
+For example, we might want to know if some of the measured traits are redundant (i.e., could our data be represented in fewer dimensions)? 
+Principal components analysis has the goal of taking linear combinations of multiple variables and creating new composite variables that are orthogonal (i.e., independent of each other) and in order of decreasing importance. 
+That is the first principal component (PC1) explains the most variation in the data. PC2 explains the most remaining variation in the data with the constraint that it is orthogonal to PC1, and so on.
+Note that PCA is _especially useful when the variables are highly correlated_, which would suggest redundancy in the variables that can be exploited by principal components.
+This makes sense conceptually: if the variables are all completely uncorrelated, there's no way PCA can reduce the dimensionality any further because you need all the original variables to explain the data; if the variables are all perfectly correlated, you only need one axis to explain all the variation. 
+```{r, fig.align='center', fig.width=5}
+# overall, our traits look pretty independent, except SLA & N_mass
+# suggest PCA might not be all that useful here
+round(cor(traits),2) 
+# But maybe we can represent this variation in fewer than 8 dimensions
+trait.pca <- prcomp(traits, scale = T) # prcomp() uses SVD, princomp() uses eigens
+summary(trait.pca) # the first 2 axes explain almost 50% of the data if which may be sufficient
+# we can visualize this with a scree plot
+plot(trait.pca, xlab = "PCs") # so no, not a great dimension reduction for this data set
+# look at the PCA loadings to see which traits are represented by the axes
+round(trait.pca$rotation[,1:2],3)
+# so PC1 ordinates high SLA and N_mass against Small angle, short, thin plants
+# Higher PC2 values indicate tall, big seeded plants
+# ugly PCA biplot, but you can see which species have similar traits
+biplot(trait.pca, xlim = c(-.4, 0.4), col = c(rgb(0,0,0, alpha = 0.5),"blue"))
+# We can visualize which species are "closer" in this reduced space
+spec.dists <- dist(trait.pca$x[,1], trait.pca$x[,2], method = "euclidean")
+heatmap.2(as.matrix(spec.dists), symm = T, col = inferno, trace = "none", density.info = "none")
+```
+### Principal Coordinates Analysis (PCoA or PCO)
+We may also want to know which sampling locations tend to contain the most similar species abundances. 
+While PCA operates directly on raw data, it preserves Euclidean distances, which are not always appropriate for picking out ecologically meaningful site differences without transformations (e.g., Hellinger, Chord). 
+An alternative approach, Principal Coordinates Analysis (PCoA or PCO), operates on a distance matrix, where the entries in the matrix reflect differences among sites (i.e., larger distances indicate more different community structure). 
+Notably, PCoA performed on a Euclidean distance matrix is equivalent to PCA on raw data. 
+Here, we will perform PCoA on a Hellinger distance matrix. 
+```{r, fig.align='center'}
+# Similar to PCA, but takes a dissimilarity matrix as its input instead of raw data
+# we'll transform the abundances then take the euclidean distance
+aravo.hel <- decostand(comm, method = "hellinger")
+aravo.hel.dist <- vegdist(aravo.hel, method = "euclidean")
+aravo.pcoa <- cmdscale(aravo.hel.dist, eig = T)
+# eigenvals(aravo.pcoa) / sum(eigenvals(aravo.pcoa))
+# Note, with euclidean distances, PCoA is the same as PCA
+# If using Hellinger transformed abundances, you can also do a PCA to get spec scores
+# prcomp(decostand(comm, method = "hellinger")))
+# biplot(prcomp(decostand(comm, method = "hellinger"))) # and you can plot biplots
+# ordiplot(aravo.pcoa)  # for a quick plot
+# Or make a fancy plot (with some fancy labels using ggrepel package)
+data.frame(scores(aravo.pcoa)) %>% 
+  rownames_to_column("Site") %>% 
+  mutate(PCoA1 = Dim1, PCoA2 = Dim2) %>% 
+  ggplot(aes(x = PCoA1, y = PCoA2, label = Site)) + 
+  geom_point(size = 0.2*richness$richness, alpha = 0.5) + 
+  geom_text_repel(alpha = 1, size = 2) + 
+  theme_cowplot() + 
+  xlab(paste0("PCoA 1 (", round(100*eigenvals(aravo.pcoa)[1]/sum(eigenvals(aravo.pcoa)), 1)," %)")) +
+  ylab(paste0("PCoA 1 (", round(100*eigenvals(aravo.pcoa)[2]/sum(eigenvals(aravo.pcoa)), 1)," %)")) + 
+  coord_fixed()
+```
+We can also think back to the MANOVA we performed above. 
+MANOVA assumed multivariate normal data, which species abundances usually don't follow.
+We can use a permutation-based analogue of MANOVA to see whether our categorical predictors (Form and ZoogD) explain any of the variation in the Hellinger transformed abundance data we just created. 
+This approach is called permutational ANOVA (PERMANOVA).
+```{r}
+adonis(aravo.hel ~ Form + ZoogD, data = env, method = "euclidean")
+```
+So it seems that Form and ZoogD explain quite a lot of our community data.
+### Constrained Ordination
+Because we have some environmental data from each site, we might want to use it to see if we can pull out the variables that are driving the variation in community structure across sites. 
+Constrained, or canonical, ordination does this. Some common types of constrained ordination are canonical correspondence analysis (CCA) and redundancy analysis (RDA) and distance based redundancy analysis (dbRDA). 
+Here, we'll conduct a redundancy analysis on the Hellinger transformed data.
+```{r, fig.align='center'}
+aravo.rda0 <- rda(aravo.hel ~ 1, data.frame(env)) # Note, this is a PCA
+aravo.rda1 <- rda(aravo.hel ~ Slope + Aspect + Snow + Form + ZoogD + PhysD, data.frame(env)) # you shouldn't just blindly use all variables like this
+aravo.rda <- ordiR2step(aravo.rda0, aravo.rda1) 
+# ordiR2step is a model selection routine using adjusted R2 values
+# this can be overly harsh sometimes, so use as a guide and use your knowledge of data
+rda.sum <- summary(aravo.rda)
+anova(aravo.rda0, aravo.rda, aravo.rda1)  # overall test for the models
+# or manually make a fancier plot
+env.vecs <- cbind.data.frame(center = 0, rda.sum$biplot[,c(1:2)])
+spec.scores <- cbind.data.frame(center = 0, scores(aravo.rda)$species)
+site.scores <- as.data.frame(scores(aravo.rda)$sites)
+ggplot() + 
+  # Add site scores as points
+  # geom_point(data = site.scores, aes(x = RDA1, y = RDA2)) + 
+  geom_text(data = site.scores, aes(x = RDA1, y = RDA2),
+               label = rownames(site.scores)) + 
+  
+  # Add species scores as red vectors
+  geom_segment(data = spec.scores, 
+               aes(x = center, y = center, xend = RDA1, yend = RDA2), 
+               alpha = 0.1, color = "red",
+             arrow = arrow(angle = 20, length = unit(.1, "inches"), type = "open"), 
+             show.legend = F) + 
+  # geom_text(data = spec.scores, aes(x = 2*RDA1, y = 2*RDA2),
+  #             label = rownames(spec.scores), color = "red", alpha = 0.5) + 
+  
+  # Add environmental vectors in blue
+  geom_segment(data = env.vecs,
+             aes(x = center, y = center, xend = RDA1, yend = RDA2),
+             arrow = arrow(angle = 20, length = unit(.1, "inches"), type = "open"),
+             show.legend = F, alpha = 1, color = "blue") +
+  geom_label_repel(data = env.vecs, aes(x = RDA1, y = RDA2),
+                    label = rownames(env.vecs), color = "blue", 
+                   segment.alpha = 0.3) + 
+  theme_cowplot() + 
+  coord_fixed() + 
+  xlim(-0.7,1)
+```
+# Useful References
+Borcard et al. (2011) Numerical Ecology with R.  
+Gauch (1982) Multivariate Analysis in Community Ecology.  
+Jongman et al. (1995) Data Analysis in Community and Landscape Ecology.  
+Legendre & Legendre (2012) Numerical Ecology.  
+Manly (2017) Multivariate Statistical Methods: a Primer.  
